@@ -27,6 +27,51 @@
  * 一次调度也可能继续选择原任务，此时不会发生寄存器和内核栈切换。
  * 阅读并发路径时，应结合下文的状态维度说明和 Serialization rules，
  * 特别区分任务请求睡眠、离开运行队列以及完全切出 CPU 这三个时刻。
+ *
+ * 按问题查找实现：
+ *   1. 谁保护调度状态：Serialization rules、task_rq_lock()。
+ *   2. 怎样计算执行时间：update_rq_clock()、sched_tick()。
+ *   3. 怎样请求让出 CPU：resched_curr()、各个 schedule 入口。
+ *   4. 怎样入队和出队：enqueue/dequeue_task()、activate/deactivate_task()。
+ *   5. 怎样改变 CPU 归属：affine_move_task()、migration_cpu_stop()。
+ *   6. 怎样唤醒睡眠者：try_to_wake_up() 及 ttwu_* 辅助函数。
+ *   7. 怎样启动新任务：sched_fork()、wake_up_new_task()、schedule_tail()。
+ *   8. 怎样选择和切换：pick_next_task()、__schedule()、context_switch()。
+ *   9. 怎样管理组与带宽：sched_*_group()、tg_set_cfs_bandwidth()。
+ *  10. 怎样回收地址空间并发编号：sched_mm_cid_*()。
+ *
+ * 几个贯穿全文的约定：
+ *   - rq 属于 CPU，task_struct 属于任务；任务迁移会改变所属 rq。
+ *   - TASK_RUNNING 的数值是 0，既包括正在执行，也包括等待 CPU；
+ *     它不等价于 rq->curr == p，也不表示任务一定已经入队。
+ *   - ENQUEUE_* / DEQUEUE_* 描述本次队列操作的原因与记账方式；
+ *     WF_* 描述唤醒来源和放置条件，不能把两组标志混用。
+ *   - “禁止抢占”稳住本 CPU，“关闭中断”防止本 CPU 中断重入，
+ *     自旋锁负责跨 CPU 互斥；三者各自解决不同的并发问题。
+ *   - 调度类负责策略，本文件把类回调与时钟、PSI、uclamp、RCU、
+ *     地址空间和体系结构切换接起来。阅读单个回调时需同时看 sched.h。
+ *
+ * 以下注释解释各 CONFIG 分支的语义；某条路径是否参与当前构建，
+ * 应以本仓库 .config 为准，不能仅凭函数出现在文件中判断。
+ *
+ * 初读建议沿两条主线往返看，而不必一次读完全部配置分支：
+ *   “睡下去”：schedule() -> __schedule() -> try_to_block_task()
+ *               -> pick_next_task() -> context_switch()。
+ *   “叫起来”：wake_up_process() -> try_to_wake_up() -> ttwu_queue()
+ *               -> ttwu_do_activate() -> wakeup_preempt()。
+ * 两条线在同一个任务上并发相遇，下面的锁和内存屏障就是交接协议。
+ * 再看迁移、核心调度和组控制时，可以追问：它改变了哪个任务状态、
+ * 哪个 CPU 的队列，以及哪一方负责把未完成的操作接着做完？
+ *
+ * 常见缩写与语法：
+ *   rq：每个逻辑 CPU 的运行队列；SMT 兄弟是共享物理核的逻辑 CPU。
+ *   IPI：CPU 间中断，通知远端处理请求；LLC：最后一级缓存。
+ *   PELT：对任务/队列负载及利用率做随时间衰减的统计。
+ *   PSI：统计 CPU、内存和 I/O 等资源压力造成的停顿。
+ *   RCU：使读者可并发访问对象，回收方等旧读者退出后再释放；
+ *        它不自动保证被读对象的所有字段都不变化。
+ *   guard()/scoped_guard()：作用域管理，离开作用域时自动解锁或
+ *        恢复相应状态；没看见显式 unlock 不代表遗漏了解锁。
  */
 #define INSTANTIATE_EXPORTED_MIGRATE_DISABLE
 #include <linux/sched.h>
@@ -306,6 +351,12 @@ static inline bool prio_less(const struct task_struct *a,
 /*
  * __sched_core_less - 按核心 cookie 和任务优先级确定核心调度树中的顺序。
  */
+/*
+ * 核心树是每个 rq 上的辅助索引，不替代调度类自己的队列。
+ * 第一关键字 cookie 将兼容任务放在连续区间，第二关键字把高优先级
+ * 任务排在区间左端，因而可先定位 cookie，再跳过被带宽限流的任务。
+ * cookie 为 0 的任务不进该树；普通候选仍由调度类的 pick_task 取得。
+ */
 static inline bool __sched_core_less(const struct task_struct *a,
 				     const struct task_struct *b)
 {
@@ -359,6 +410,7 @@ void sched_core_enqueue(struct rq *rq, struct task_struct *p)
 	if (p->se.sched_delayed)
 		return;
 
+	/* 使此前缓存的整核选择失效，包括不进入 cookie 树的普通任务。 */
 	rq->core->core_task_seq++;
 
 	if (!p->core_cookie)
@@ -562,6 +614,10 @@ static void sched_core_assert_empty(void)
  */
 static void __sched_core_enable(void)
 {
+	/*
+	 * 先让取锁者进入能重试锁指针的慢路径，等待旧取锁临界区退出，
+	 * 最后重绑为共享锁。顺序反过来会让同一 rq 被两把锁分别保护。
+	 */
 	static_branch_enable(&__sched_core_enabled);
 	/*
 	 * Ensure all previous instances of raw_spin_rq_*lock() have finished
@@ -667,6 +723,17 @@ EXPORT_SYMBOL(__trace_set_current_state);
  * 因此，设置睡眠状态不等于已经出队，出队也不等于已经切出 CPU。
  * pi_lock 串行化同一任务的唤醒和属性修改，rq 锁保护队列及调度选择；
  * 不能用其中一个状态位代替另一个状态位或相应的锁。
+ *
+ * 普通任务的几种典型快照（不含代理执行和延迟出队）：
+ *   __state          on_rq       on_cpu   含义
+ *   TASK_RUNNING     QUEUED      0        已就绪，等待 CPU
+ *   TASK_RUNNING     QUEUED      1        正在执行或处于切换交接窗口
+ *   睡眠状态         QUEUED      1        已请求睡眠，尚未由调度器出队
+ *   睡眠状态         0           1        已出队，旧 CPU 仍在完成切出
+ *   睡眠状态         0           0        已完全阻塞
+ *   TASK_WAKING      0           0 或 1   唤醒已认领，等待切出/入队
+ * 这只是解释状态含义，不是无锁检查规则：分别读取三个字段可能得到
+ * 来自不同时刻的值。需要可靠结论时必须使用相应锁或配对的内存序。
  */
 
 /*
@@ -846,6 +913,11 @@ void double_rq_lock(struct rq *rq1, struct rq *rq2)
 {
 	lockdep_assert_irqs_disabled();
 
+	/*
+	 * 两个 CPU 同时互相搬任务时，也必须按同一顺序拿锁，否则会
+	 * 形成 A 等 B、B 等 A。核心调度下两个 rq 还可能共用一把锁，
+	 * 所以下面比较实际锁指针，不能仅凭 rq1 != rq2 就再锁一次。
+	 */
 	if (rq_order_less(rq2, rq1))
 		swap(rq1, rq2);
 
@@ -873,6 +945,10 @@ struct rq *__task_rq_lock(struct task_struct *p, struct rq_flags *rf)
 	for (;;) {
 		rq = task_rq(p);
 		raw_spin_rq_lock(rq);
+		/*
+		 * 读 task_rq() 到拿锁之间任务可能迁走；即便 CPU 编号恰好
+		 * 相同，也必须排除 MIGRATING，因为目标端可能尚未完成入队。
+		 */
 		if (likely(rq == task_rq(p) && !task_on_rq_migrating(p))) {
 			rq_pin_lock(rq, rf);
 			return rq;
@@ -897,6 +973,11 @@ struct rq *task_rq_lock(struct task_struct *p, struct rq_flags *rf)
 	struct rq *rq;
 
 	for (;;) {
+		/*
+		 * pi_lock 在外、rq 锁在内。pi_lock 稳住唤醒和属性修改，
+		 * 但迁移者可能只持 rq 锁，故下面仍要验证归属并按需重试。
+		 * rf 保存 IRQ 状态和 lockdep 的锁固定信息，解锁时配对恢复。
+		 */
 		raw_spin_lock_irqsave(&p->pi_lock, rf->flags);
 		rq = task_rq(p);
 		raw_spin_rq_lock(rq);
@@ -945,6 +1026,11 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
  */
 	s64 __maybe_unused steal = 0, irq_delta = 0;
 
+	/*
+	 * delta 是本 rq 距离上次更新经过的时间；只有扣掉可单独统计的
+	 * IRQ/steal 部分后，剩余量才加入 clock_task。它仍是队列时钟，
+	 * 并非某个任务的累计运行时间；后者由调度类 update_curr() 结算。
+	 */
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
 	if (irqtime_enabled()) {
 		irq_delta = irq_time_read(cpu_of(rq)) - rq->prev_irq_time;
@@ -1065,6 +1151,10 @@ static enum hrtimer_restart hrtick(struct hrtimer *timer)
 
 	rq_lock(rq, &rf);
 	update_rq_clock(rq);
+	/*
+	 * queued=1 表示高精度时间片边界，而非普通周期 tick；调度类据此
+	 * 判断是否请求抢占。这里只记账/设标志，硬中断中不直接换任务。
+	 */
 	rq->donor->sched_class->task_tick(rq, rq->curr, 1);
 	rq_unlock(rq, &rf);
 
@@ -1124,6 +1214,7 @@ void hrtick_start(struct rq *rq, u64 delay)
 	if (rq == this_rq())
 		__hrtick_restart(rq);
 	else
+		/* PINNED 定时器须由目标 CPU 启动，异步 CSD 转交这项操作。 */
 		smp_call_function_single_async(cpu_of(rq), &rq->hrtick_csd);
 }
 
@@ -1195,6 +1286,11 @@ static bool set_nr_if_polling(struct task_struct *p)
 	struct thread_info *ti = task_thread_info(p);
 	typeof(ti->flags) val = READ_ONCE(ti->flags);
 
+	/*
+	 * “观察轮询”和“设置请求”必须属于同一次原子状态转换。
+	 * 若 idle 在二者之间退出轮询，CAS 会失败并重读，调用者才能
+	 * 正确选择发送 IPI，避免目标已经睡下却无人把它唤醒。
+	 */
 	do {
 		if (!(val & _TIF_POLLING_NRFLAG))
 			return false;
@@ -1227,6 +1323,12 @@ static inline bool set_nr_if_polling(struct task_struct *p)
 
 /*
  * __wake_q_add - 原子认领任务的唤醒节点并加入队列，已被排队时返回 false。
+ *
+ * wake_q 是调用者收集“稍后需要唤醒谁”的临时清单，不是 CPU 的 rq，
+ * 也不是存放等待者的 wait_queue_head。典型用法是在锁内选中等待者，
+ * 解锁后 wake_up_q() 再逐一取得调度器锁，缩短原锁的持有时间。
+ * head 的串接由当前上下文负责；同一 task 的节点认领需要原子操作，
+ * 因为其他 CPU 也可能同时请求唤醒该任务。
  */
 static bool __wake_q_add(struct wake_q_head *head, struct task_struct *task)
 {
@@ -1295,6 +1397,11 @@ void wake_q_add(struct wake_q_head *head, struct task_struct *task)
  */
 void wake_q_add_safe(struct wake_q_head *head, struct task_struct *task)
 {
+	/*
+	 * safe 指已有的任务引用会被接管，不表示这里马上完成了唤醒。
+	 * 成功时引用留给 wake_up_q() 释放，失败时本处就释放，二者只能
+	 * 发生一次；调用者不能再把同一份引用 put 一次。
+	 */
 	if (!__wake_q_add(head, task))
 		put_task_struct(task);
 }
@@ -1310,6 +1417,10 @@ void wake_up_q(struct wake_q_head *head)
 		struct task_struct *task;
 
 		task = container_of(node, struct task_struct, wake_q);
+		/*
+		 * 先保存后继再释放当前节点的入队标志；标志清零后其他 CPU
+		 * 就可能复用 task->wake_q，不能再依赖该节点中的 next。
+		 */
 		node = node->next;
 		/* pairs with cmpxchg_relaxed() in __wake_q_add() */
 		WRITE_ONCE(task->wake_q.next, NULL);
@@ -1600,6 +1711,7 @@ static void nohz_csd_func(void *info)
 
 	rq->idle_balance = idle_cpu(cpu);
 	if (rq->idle_balance) {
+		/* IPI 只转交请求，实际均衡留给 SCHED_SOFTIRQ 执行。 */
 		rq->nohz_idle_balance = flags;
 		__raise_softirq_irqoff(SCHED_SOFTIRQ);
 	}
@@ -1633,6 +1745,10 @@ bool sched_can_stop_tick(struct rq *rq)
 {
 	int fifo_nr_running;
 
+	/*
+	 * 停 tick 的前提是当前调度策略不再需要周期性干预，不能只数
+	 * rq->nr_running：DL 预算、RR 轮转和公平组的带宽都可能要求 tick。
+	 */
 	/* Deadline tasks, even if single, need the tick */
 	if (rq->dl.dl_nr_running)
 		return false;
@@ -1774,6 +1890,15 @@ void set_load_weight(struct task_struct *p, bool update_load)
  * updates or API abuses.
  */
 static __maybe_unused DEFINE_MUTEX(uclamp_mutex);
+
+/*
+ * uclamp 的三层表示：
+ *   p->uclamp_req[]：任务请求，可能由用户或默认策略设置；
+ *   p->uclamp[]：叠加组/系统约束后的有效值及所在桶的活动记录；
+ *   rq->uclamp[]：本 CPU 所有参与计数任务的桶和聚合值。
+ * 值使用 SCHED_CAPACITY_SCALE 的容量刻度，不是纳秒、时间片或带宽配额。
+ * 它约束利用率信号对选核/频率决策的影响，不保证任务获得的 CPU 时间。
+ */
 
 /* Max allowed minimum utilization */
 static unsigned int __maybe_unused sysctl_sched_uclamp_util_min = SCHED_CAPACITY_SCALE;
@@ -1968,6 +2093,11 @@ uclamp_eff_get(struct task_struct *p, enum uclamp_id clamp_id)
 	struct uclamp_se uc_req = uclamp_tg_restrict(p, clamp_id);
 	struct uclamp_se uc_max = uclamp_default[clamp_id];
 
+	/*
+	 * 名字中的 default 还承担管理员上限的角色，并非仅在任务没有
+	 * 请求时才生效。分别处理 MIN/MAX，每个维度都先受组约束，再
+	 * 受系统允许值限制；不能直接把 uclamp_req 当成最终生效值。
+	 */
 	/* System default restrictions always apply */
 	if (unlikely(uc_req.value > uc_max.value))
 		return uc_max;
@@ -2018,6 +2148,10 @@ static inline void uclamp_rq_inc_id(struct rq *rq, struct task_struct *p,
 	/* Update task effective clamp */
 	p->uclamp[clamp_id] = uclamp_eff_get(p, clamp_id);
 
+	/*
+	 * 记录本次入队实际计入的桶；出队必须按这份有效值减计数，
+	 * 不能根据期间可能被修改的 uclamp_req 再算一个桶。
+	 */
 	bucket = &uc_rq->bucket[uc_se->bucket_id];
 	bucket->tasks++;
 	uc_se->active = true;
@@ -2184,6 +2318,7 @@ static inline void uclamp_rq_reinc_id(struct rq *rq, struct task_struct *p,
 	if (!p->uclamp[clamp_id].active)
 		return;
 
+	/* 同一 rq 锁内先撤销旧桶，再按新约束计入新桶，保持引用成对。 */
 	uclamp_rq_dec_id(rq, p, clamp_id);
 	uclamp_rq_inc_id(rq, p, clamp_id);
 
@@ -2508,6 +2643,20 @@ unsigned long get_wchan(struct task_struct *p)
  * 同时更新时钟、钳制、PSI 和核心调度信息。
  * 调用者须持有运行队列锁。
  */
+/*
+ * 队列操作分两层：enqueue/dequeue_task() 操作调度类及公共记账，
+ * activate/deactivate_task() 还管理任务的全局 on_rq 状态。
+ * 修改属性时用 SAVE/RESTORE 临时摘下再放回，不是一次新的睡眠/唤醒；
+ * NOCLOCK 表示调用链上已更新时钟，避免重复读取和重复记账。
+ *
+ * 对照调用原因理解 flags，比记住每个数值更有用：
+ *   SLEEP / WAKEUP：任务从可运行变成阻塞，或从阻塞恢复。
+ *   SAVE / RESTORE：为了改属性暂时摘下，尽量保留已有等待统计。
+ *   MOVE：与 SAVE/RESTORE 配合时不保留原队列位置。
+ *   DELAYED：完成延迟出队，或撤销延迟出队以恢复可运行资格。
+ * 注意：SLEEP 不保证立刻从公平队列移除，dequeue_task() 的布尔
+ * 返回值正是为了把“接受睡眠请求”与“实体已经移除”区分开。
+ */
 void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 {
 	if (!(flags & ENQUEUE_NOCLOCK))
@@ -2571,6 +2720,7 @@ void activate_task(struct rq *rq, struct task_struct *p, int flags)
 
 	enqueue_task(rq, p, flags);
 
+	/* QUEUED 是入队完成后的发布点；半迁移期间仍保持 MIGRATING。 */
 	WRITE_ONCE(p->on_rq, TASK_ON_RQ_QUEUED);
 	ASSERT_EXCLUSIVE_WRITER(p->on_rq);
 }
@@ -2665,6 +2815,11 @@ void wakeup_preempt(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct task_struct *donor = rq->donor;
 
+	/*
+	 * 例如 RT 任务唤醒时可直接压过 fair 类；两个 fair 任务之间谁
+	 * 更值得运行，则须由 fair 自己比较。这里请求抢占的是执行者
+	 * rq->curr，比较的调度资格却属于 donor，代理执行时尤须区分。
+	 */
 	if (p->sched_class == donor->sched_class)
 		donor->sched_class->wakeup_preempt(rq, p, flags);
 	else if (sched_class_above(p->sched_class, donor->sched_class))
@@ -2849,6 +3004,11 @@ static void migrate_disable_switch(struct rq *rq, struct task_struct *p)
 		.flags     = SCA_MIGRATE_DISABLE,
 	};
 
+	/*
+	 * migrate_disable() 允许任务被抢占，只禁止它换 CPU。直到真正
+	 * 切出时才需把 cpus_ptr 指向单 CPU 掩码，让后续选核仍落在原处；
+	 * cpus_mask 保留正常亲和性，migrate_enable() 再把指针切回。
+	 */
 	if (likely(!p->migration_disabled))
 		return;
 
@@ -2913,6 +3073,11 @@ static inline bool rq_has_pinned_tasks(struct rq *rq)
  */
 static inline bool is_cpu_allowed(struct task_struct *p, int cpu)
 {
+	/*
+	 * online 表示 CPU 已能参与运行，active 表示可承接普通任务放置。
+	 * 热插拔过渡期两者不相同；绑定内核线程和禁止迁移任务需要
+	 * 留在 online 但尚未/不再 active 的 CPU 上完成启动或收尾。
+	 */
 	/* When not in the task's cpumask, no point in looking further. */
 	if (!task_allowed_on_cpu(p, cpu))
 		return false;
@@ -2996,6 +3161,11 @@ struct migration_arg {
  * @stop_pending: is @stop_work in use
  */
 struct set_affinity_pending {
+	/*
+	 * 此对象可由首个请求者放在栈上：refs 保证所有等待者退出后
+	 * 才能销毁，done 通知迁移要求已满足，stop_pending 保证同一
+	 * stop_work 不被重复提交。三者分别管理生命周期、结果和在途工作。
+	 */
 	refcount_t		refs;
 	unsigned int		stop_pending;
 	struct completion	done;
@@ -3059,6 +3229,11 @@ static int migration_cpu_stop(void *data)
 	 */
 	flush_smp_call_function_queue();
 
+	/*
+	 * stopper 已把原执行任务挤下 CPU，再取得两层锁验证最新状态。
+	 * 请求提交到执行之间可以发生唤醒、迁移、再次改亲和性；
+	 * arg 中的 CPU 是请求时的意图，不能代替此处的重新检查。
+	 */
 	raw_spin_lock(&p->pi_lock);
 	rq_lock(rq, &rf);
 
@@ -3089,6 +3264,7 @@ static int migration_cpu_stop(void *data)
 			update_rq_clock(rq);
 			rq = __migrate_task(rq, &rf, p, arg->dest_cpu);
 		} else {
+			/* 睡眠任务只指定下次唤醒的首选 CPU，不搬队列。 */
 			p->wake_cpu = arg->dest_cpu;
 		}
 
@@ -3196,6 +3372,13 @@ out_unlock:
 /*
  * set_cpus_allowed_common - 更新通用亲和性字段，
  * 或按迁移禁用状态切换有效掩码指针。
+ *
+ * 亲和性有三个容易混淆的表示：
+ *   cpus_mask：任务当前的正常亲和性集合；
+ *   cpus_ptr：选核实际使用的集合，迁移禁用期间可指向单 CPU 掩码；
+ *   user_cpus_ptr：按需保存的用户亲和性，用于约束调整后的恢复。
+ * 改正常集合与临时固定 CPU 是不同操作；前者还要更新允许 CPU 数，
+ * 后者只替换指针，避免把用户的正常集合破坏掉。
  */
 void set_cpus_allowed_common(struct task_struct *p, struct affinity_context *ctx)
 {
@@ -3245,6 +3428,11 @@ __do_set_cpus_allowed(struct task_struct *p, struct affinity_context *ctx)
 	queued = task_on_rq_queued(p);
 	running = task_current_donor(rq, p);
 
+	/*
+	 * 亲和性会影响调度类的可迁移任务索引和当前实体状态，不能只改
+	 * cpumask 字段。先保存队列/当前身份，回调重建类内约束后再恢复；
+	 * 这里只更新约束，是否需要换 CPU 由 affine_move_task() 决定。
+	 */
 	if (queued) {
 		/*
 		 * Because __kthread_bind() calls this on blocked tasks without
@@ -3452,6 +3640,14 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
 	struct set_affinity_pending my_pending = { }, *pending = NULL;
 	bool stop_pending, complete = false;
 
+	/*
+	 * 三种后续动作：
+	 *   已处于允许 CPU：通常直接结束，并处理此前等待者；
+	 *   正执行或 TASK_WAKING：交给 stopper，避免与切换/异步入队竞态；
+	 *   已排队且不执行：可直接搬队列，但 migration_disabled 时必须等。
+	 * 普通调用者在锁外等待 done；migrate_enable 路径只提交工作，
+	 * 让当前 CPU 的 stopper 得到执行机会，不能等待自身恢复迁移能力。
+	 */
 	/*
 	 * Can the task run on the task's current CPU? If so, we're done
 	 *
@@ -3681,6 +3877,7 @@ static int __set_cpus_allowed_ptr_locked(struct task_struct *p,
 		goto out;
 	}
 
+	/* 先重建亲和性约束，再把任务移动到满足约束的位置。 */
 	__do_set_cpus_allowed(p, ctx);
 
 	return affine_move_task(rq, p, rf, dest_cpu, ctx->flags);
@@ -3915,6 +4112,11 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 	trace_sched_migrate_task(p, new_cpu);
 
 	if (task_cpu(p) != new_cpu) {
+		/*
+		 * 类回调在 CPU 字段改变前运行，便于从源 rq 转换时钟/负载。
+		 * rseq 要在返回用户态前中止依赖旧 CPU 的临界区；MM CID 只在
+		 * 此处记录源 CPU，目标队列激活时才完成编号转移或回收。
+		 */
 		if (p->sched_class->migrate_task_rq)
 			p->sched_class->migrate_task_rq(p, new_cpu);
 		p->se.nr_migrations++;
@@ -4102,6 +4304,11 @@ static int select_fallback_rq(int cpu, struct task_struct *p)
 	enum { cpuset, possible, fail } state = cpuset;
 	int dest_cpu;
 
+	/*
+	 * 优先同 NUMA 节点，再扫描现有允许集合；都失败才依次放宽
+	 * cpuset 和 CPU 亲和性。这里是保证任务能继续运行的兜底路径，
+	 * 并不是调度类用于优化负载、容量或缓存局部性的常规选核算法。
+	 */
 	/*
 	 * If the node that the CPU is on has been offlined, cpu_to_node()
 	 * will return -1. There is no CPU on the node, and we should
@@ -4315,6 +4522,10 @@ ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
 
 	lockdep_assert_rq_held(rq);
 
+	/*
+	 * nr_uninterruptible 只保证跨 CPU 求和有意义：睡眠时可能在源 rq
+	 * 增加、唤醒时在目标 rq 减少，不能把单个 rq 的值当本地睡眠者数。
+	 */
 	if (p->sched_contributes_to_load)
 		rq->nr_uninterruptible--;
 
@@ -4433,6 +4644,7 @@ void sched_ttwu_pending(void *arg)
 	if (!llist)
 		return;
 
+	/* 批次共用一次取锁和时钟更新；每个任务已由 TASK_WAKING 认领。 */
 	rq_lock_irqsave(rq, &rf);
 	update_rq_clock(rq);
 
@@ -4568,6 +4780,11 @@ bool cpus_share_resources(int this_cpu, int that_cpu)
  */
 static inline bool ttwu_queue_cond(struct task_struct *p, int cpu)
 {
+	/*
+	 * 这是“谁来做入队工作”的选择，不是“任务去哪个 CPU”的选择；
+	 * cpu 已由上层给出。跨 LLC 直接改远端 rq 会来回传递缓存行，
+	 * 让目标 CPU 自己入队通常更划算，但热插拔和类策略有优先权。
+	 */
 	/* See SCX_OPS_ALLOW_QUEUED_WAKEUP. */
 	if (!scx_allow_ttwu_queue(p))
 		return false;
@@ -4638,6 +4855,10 @@ static void ttwu_queue(struct task_struct *p, int cpu, int wake_flags)
 	struct rq *rq = cpu_rq(cpu);
 	struct rq_flags rf;
 
+	/*
+	 * 返回前可能仅完成“提交”，任务仍是 TASK_WAKING；此时由目标
+	 * CPU 负责最终入队。同步路径则由唤醒者跨 CPU 取得目标 rq 锁。
+	 */
 	if (ttwu_queue_wakelist(p, cpu, wake_flags))
 		return;
 
@@ -4823,6 +5044,17 @@ bool ttwu_state_match(struct task_struct *p, unsigned int state, int *success)
  *
  * Return: %true if @p->state changes (an actual wakeup was done),
  *	   %false otherwise.
+ */
+/*
+ * 普通睡眠/唤醒的时间轴（延迟出队和代理执行另见对应分支）：
+ *   等待方：设置睡眠 __state -> 检查条件 -> schedule -> on_rq=0
+ *           -> 切到另一任务 -> finish_task 发布 on_cpu=0。
+ *   唤醒方：发布条件 -> 匹配 __state -> 检查 on_rq
+ *           -> 已在队列则恢复状态，否则认领为 TASK_WAKING
+ *           -> 与旧 CPU 的切出收尾同步 -> 选择 CPU -> 激活。
+ * 这些步骤可交错，因此这里既需要 pi_lock/rq 锁，也需要屏障。
+ * success 表示本次状态唤醒被接受，不保证入队已完成或任务立即执行；
+ * 仅 saved_state 匹配时也算成功，但须等锁唤醒或解冻才能真正运行。
  */
 int try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 {
@@ -5076,6 +5308,11 @@ int task_call_func(struct task_struct *p, task_call_f func, void *arg)
 
 	raw_spin_lock_irqsave(&p->pi_lock, rf.flags);
 
+	/*
+	 * pi_lock 只能挡住新唤醒，挡不住一个可运行任务被切换或出入队。
+	 * 完全阻塞且已切出的任务才可只用 pi_lock；其他状态还须锁住 rq。
+	 * 回调在关中断的锁内执行，应只做轻量检查/更新，不能睡眠。
+	 */
 	if (__task_needs_rq_lock(p))
 		rq = __task_rq_lock(p, &rf);
 
@@ -5173,6 +5410,11 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 {
 	p->on_rq			= 0;
 
+	/*
+	 * p->on_rq 是核心调度层的成员状态，se.on_rq 是公平实体的
+	 * 成员状态；RT、DL 等类还有自己的链接/状态。task_struct 同时
+	 * 内嵌这些实体，但一次只按当前 sched_class 解释对应的调度结构。
+	 */
 	p->se.on_rq			= 0;
 	p->se.exec_start		= 0;
 	p->se.sum_exec_runtime		= 0;
@@ -5447,6 +5689,11 @@ late_initcall(sched_core_sysctl_init);
  */
 int sched_fork(u64 clone_flags, struct task_struct *p)
 {
+	/*
+	 * fork 已复制父 task_struct，这里必须清除父任务的队列链接、
+	 * 累计运行时间和在 CPU 状态。继承策略与新建运行实体是两件事，
+	 * 不能把父任务当前的调度位置或 PI 临时提升一并继承。
+	 */
 	__sched_fork(clone_flags, p);
 	/*
 	 * We mark the process as NEW here. This guarantees that
@@ -5489,6 +5736,7 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 		p->sched_reset_on_fork = 0;
 	}
 
+	/* DL 继承若未被 reset-on-fork 化解，此路径拒绝创建，未复制预算。 */
 	if (dl_prio(p->prio))
 		return -EAGAIN;
 
@@ -5628,6 +5876,10 @@ void wake_up_new_task(struct task_struct *p)
 	update_rq_clock(rq);
 	post_init_entity_util_avg(p);
 
+	/*
+	 * INITIAL 让调度类执行首次放置规则；这不属于睡眠后的 WAKEUP，
+	 * 无需结束旧的阻塞记账。首次入队同样只提出抢占请求。
+	 */
 	activate_task(rq, p, ENQUEUE_NOCLOCK | ENQUEUE_INITIAL);
 	trace_sched_wakeup_new(p);
 	wakeup_preempt(rq, p, wake_flags);
@@ -5765,6 +6017,10 @@ fire_sched_out_preempt_notifiers(struct task_struct *curr,
 static inline void prepare_task(struct task_struct *next)
 {
 	/*
+	 * 此时 prev 尚未清除 on_cpu，所以短暂出现两个 on_cpu==1
+	 * 是正常交接窗口，不能据此推断同一逻辑 CPU 同时执行两个任务。
+	 */
+	/*
 	 * Claim the task as running, we do this before switching to it
 	 * such that any running task will have this set.
 	 *
@@ -5809,6 +6065,10 @@ static void do_balance_callbacks(struct rq *rq, struct balance_callback *head)
 	lockdep_assert_rq_held(rq);
 
 	while (head) {
+		/*
+		 * 先摘除链接，允许回调重新排队；回调可能暂时放下 rq 锁，
+		 * 因此不能在复杂的调度类属性更新中间直接执行它。
+		 */
 		func = (void (*)(struct rq *))head->func;
 		next = head->next;
 		head->next = NULL;
@@ -5934,6 +6194,11 @@ static inline void finish_lock_switch(struct rq *rq)
 	 * prev into current:
 	 */
 	spin_acquire(&__rq_lockp(rq)->dep_map, 0, 0, _THIS_IP_);
+	/*
+	 * 普通的“取锁者必须亲自解锁”在此有意被调度器打破。若在
+	 * switch_to() 前真正放锁，远端就可能重排或迁移尚未切完的任务；
+	 * 调试工具的 release/acquire 标注是在描述交接，并非缩短临界区。
+	 */
 	__balance_callbacks(rq);
 	raw_spin_rq_unlock_irq(rq);
 }
@@ -5992,6 +6257,11 @@ static inline void
 prepare_task_switch(struct rq *rq, struct task_struct *prev,
 		    struct task_struct *next)
 {
+	/*
+	 * 仍在 prev 的执行上下文：先结束性能/调度统计和 rseq 临界区，
+	 * 再通知依赖 CPU 状态的使用者、撤下本地映射，最后认领 next。
+	 * 这些钩子处理的对象不同，不应与稍后的寄存器切换混为一谈。
+	 */
 	kcov_prepare_switch(prev);
 	sched_info_switch(rq, prev, next);
 	perf_event_task_sched_out(prev, next);
@@ -6030,6 +6300,11 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	struct mm_struct *mm = rq->prev_mm;
 	unsigned int prev_state;
 
+	/*
+	 * 已在切入任务的栈上。局部变量来自该任务上次切出时保存的栈，
+	 * 它可能已迁到另一个 CPU，所以重新取 this_rq()；传入的 prev
+	 * 则是本次刚切出的任务，而非本任务上次让出 CPU 时的对手。
+	 */
 	/*
 	 * The previous task will have left us with a preempt_count of 2
 	 * because it left us after:
@@ -6105,6 +6380,10 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 	}
 
 	if (unlikely(prev_state == TASK_DEAD)) {
+		/*
+		 * 死亡任务不能在自己的栈上释放自己的栈；由接替者在换栈后
+		 * 完成，task_struct 的最终回收再遵守 RCU 读者的生命周期。
+		 */
 		if (prev->sched_class->task_dead)
 			prev->sched_class->task_dead(prev);
 
@@ -6126,6 +6405,10 @@ static struct rq *finish_task_switch(struct task_struct *prev)
 asmlinkage __visible void schedule_tail(struct task_struct *prev)
 	__releases(rq->lock)
 {
+	/*
+	 * 新任务没有“上次从 switch_to 返回”的历史栈帧，由架构的 fork
+	 * 返回入口走到这里，补做普通任务在 context_switch 尾部完成的收尾。
+	 */
 	/*
 	 * New tasks start with FORK_PREEMPT_COUNT, see there and
 	 * finish_task_switch() for details.
@@ -6162,6 +6445,12 @@ static __always_inline struct rq *
 context_switch(struct rq *rq, struct task_struct *prev,
 	       struct task_struct *next, struct rq_flags *rf)
 {
+	/*
+	 * 三阶段：准备状态 -> 切地址空间/寄存器/内核栈 -> 新栈上收尾。
+	 * rq 锁贯穿前两阶段，直至 finish_task_switch() 才真正释放。
+	 * 此函数“返回”时 current 已是获得 CPU 的任务，不能把它当成
+	 * 普通函数调用后仍在原任务上继续顺序执行。
+	 */
 	prepare_task_switch(rq, prev, next);
 
 	/*
@@ -6184,6 +6473,15 @@ context_switch(struct rq *rq, struct task_struct *prev,
 	 * mm 是任务自身的用户地址空间，内核线程的 mm 为 NULL；
 	 * active_mm 则记录 CPU 正在使用或借用的地址空间。切入内核线程
 	 * 可借用切出任务的 active_mm，避免为执行内核代码切换页表。
+	 *
+	 * 可用“地址空间引用由谁持有”检查下面四种分支：
+	 *   用户任务 -> 内核线程：借用原 active_mm，按配置取得借用引用；
+	 *   内核线程 -> 内核线程：转交借用关系，清空 prev 的 active_mm；
+	 *   内核线程 -> 用户任务：切到 next->mm，借用引用延后归还；
+	 *   用户任务 -> 用户任务：按体系结构规则切换到 next->mm。
+	 * “用户任务”指 mm 非空，切换时它仍在内核态；这里不是直接
+	 * 返回用户态；同一地址空间内的线程切换也不一定要重装页表。
+	 * 借用引用的增减由 mmgrab/mmdrop_lazy_tlb 辅助函数按配置处理。
 	 */
 	if (!next->mm) {                                // to kernel
 		enter_lazy_tlb(prev->active_mm, next);
@@ -6249,6 +6547,11 @@ unsigned int nr_running(void)
 {
 	unsigned int i, sum = 0;
 
+	/*
+	 * 没有同时锁住所有 rq，求和期间任务可唤醒、阻塞或迁移，所以
+	 * 这是观察性统计。不能据此证明全系统在某一瞬间恰有 sum 个任务，
+	 * 更不能把它作为后续操作无需加锁的依据。
+	 */
 	for_each_online_cpu(i)
 		sum += cpu_rq(i)->nr_running;
 
@@ -6453,6 +6756,10 @@ unsigned long long task_sched_runtime(struct task_struct *p)
 	 * thread, breaking clock_gettime().
 	 */
 	if (task_current_donor(rq, p) && task_on_rq_queued(p)) {
+		/*
+		 * sum_exec_runtime 是已结算值；当前实体还欠从 exec_start 到
+		 * 此刻的一段时间，先由调度类 update_curr 结算再返回。
+		 */
 		prefetch_curr_exec_start(p);
 		update_rq_clock(rq);
 		p->sched_class->update_curr(rq);
@@ -6551,9 +6858,15 @@ void sched_tick(void)
 	hw_pressure = arch_scale_hw_pressure(cpu_of(rq));
 	update_hw_load_avg(rq_clock_task(rq), rq, hw_pressure);
 
+	/* 延迟请求遇到周期 tick 升为立即请求，推动重新调度。 */
 	if (dynamic_preempt_lazy() && tif_test_bit(TIF_NEED_RESCHED_LAZY))
 		resched_curr(rq);
 
+	/*
+	 * 周期 tick 是记账和策略检查点，具体时间片规则在调度类中。
+	 * 代理执行按 donor 的调度资源记账，执行者 curr 仍用于工作线程
+	 * 等执行上下文通知；两者在未启用代理执行时为同一任务。
+	 */
 	donor->sched_class->task_tick(rq, donor, 0);
 	if (sched_feat(LATENCY_WARN))
 		resched_latency = cpu_resched_latency(rq);
@@ -6573,6 +6886,7 @@ void sched_tick(void)
 		wq_worker_tick(curr);
 
 	if (!scx_switched_all()) {
+		/* 到期均衡由调度软中断推进，避免在 tick 中遍历迁移任务。 */
 		rq->idle_balance = idle_cpu(cpu);
 		sched_balance_trigger(rq);
 	}
@@ -6589,6 +6903,13 @@ struct tick_work {
 #define TICK_SCHED_REMOTE_OFFLINE	0
 #define TICK_SCHED_REMOTE_OFFLINING	1
 #define TICK_SCHED_REMOTE_RUNNING	2
+
+/*
+ * 这里的状态描述远程工作项是否应继续排队，而非 CPU 的 online 位：
+ * RUNNING 时回调自行排下一次；stop 仅改成 OFFLINING，由在途回调
+ * 降到 OFFLINE 后停止续排。若此时又 start，改回 RUNNING 即可复用
+ * 在途工作；只有从 OFFLINE 启动才新排一个，避免同一工作重复启动。
+ */
 
 /*
  * State diagram for ->state:
@@ -6627,6 +6948,11 @@ static void sched_tick_remote(struct work_struct *work)
 	struct rq *rq = cpu_rq(cpu);
 	int os;
 
+	/*
+	 * NO_HZ_FULL 停掉的是目标 CPU 的频繁本地 tick；housekeeping
+	 * 工作线程仍可低频锁住其 rq，结算运行时间并维护全局负载。
+	 * 需要周期轮转的场景不由此处理，能否停 tick 已另行检查。
+	 */
 	/*
 	 * Handle the tick only if it appears the remote CPU is running in full
 	 * dynticks mode. The check is racy by nature, but missing a tick or
@@ -6968,6 +7294,11 @@ __pick_next_task(struct rq *rq, struct rq_flags *rf)
 
 	rq->dl_server = NULL;
 
+	/*
+	 * 各调度类的优先级由类排列决定，不按所有任务的 prio 混排。
+	 * fair 类内部再使用自身的公平性/虚拟截止时间规则；不能将下面
+	 * 的公平类快路径理解为按一个全局 vruntime 树选择全系统任务。
+	 */
 	if (scx_enabled())
 		goto restart;
 
@@ -7092,6 +7423,11 @@ pick_next_task(struct rq *rq, struct rq_flags *rf)
 	struct rq *rq_i;
 	bool need_sync;
 
+	/*
+	 * 整核选择协调同一物理核的 SMT 逻辑 CPU，而非合并它们的队列。
+	 * 启用后这些 rq 共用实际锁，选择者可在一个临界区内检查兄弟 rq；
+	 * 每个 CPU 最终仍从自己的队列切入自己的 core_pick。
+	 */
 	if (!sched_core_enabled(rq))
 		return __pick_next_task(rq, rf);
 
@@ -7611,6 +7947,12 @@ pick_next_task(struct rq *rq, struct rq_flags *rf)
 #define SM_RTLOCK_WAIT		2
 
 /*
+ * sched_mode 有两种判法：调试/RCU 将正值视为抢占类切换，实际处理
+ * 任务睡眠时却仅把 SM_PREEMPT 当作抢占；RT 锁等待仍需处理阻塞。
+ * 这样既保留抢占式 RCU 所需语义，又不丢掉睡眠锁的等待请求。
+ */
+
+/*
  * Helper function for __schedule()
  *
  * Tries to deactivate the task, unless the should_block arg
@@ -7629,6 +7971,11 @@ static bool try_to_block_task(struct rq *rq, struct task_struct *p,
 	unsigned long task_state = *task_state_p;
 	int flags = DEQUEUE_NOCLOCK;
 
+	/*
+	 * 最后一次检查信号必须在真正出队之前：可中断等待若已有信号，
+	 * 撤销睡眠请求，后续即使仍选中自己也能回到调用者处理信号。
+	 * 不可中断状态并非被所有信号唤醒，具体由 signal_pending_state 判定。
+	 */
 	if (signal_pending_state(task_state, p)) {
 		WRITE_ONCE(p->__state, TASK_RUNNING);
 		*task_state_p = TASK_RUNNING;
@@ -7645,6 +7992,7 @@ static bool try_to_block_task(struct rq *rq, struct task_struct *p,
 	if (!should_block)
 		return false;
 
+	/* D 状态中排除 NOLOAD 和 FROZEN，保存此次阻塞是否计入系统负载。 */
 	p->sched_contributes_to_load =
 		(task_state & TASK_UNINTERRUPTIBLE) &&
 		!(task_state & TASK_NOLOAD) &&
@@ -7751,6 +8099,18 @@ find_proxy_task(struct rq *rq, struct task_struct *donor, struct rq_flags *rf)
 	struct task_struct *p;
 	struct mutex *mutex;
 
+	/*
+	 * 代理执行保留 donor 的调度资格，让其等待的锁持有者实际执行，
+	 * 从而推进解锁。此实现只追踪本 rq 上可运行的 mutex 拥有者；
+	 * 跨 CPU、已阻塞和延迟出队的 owner 走停用/重选分支，不能把
+	 * “沿阻塞链找到 owner”直接等同于可以安全切入该任务。
+	 *
+	 * 例如 A 的调度资格被选中，但 A 等待 B 持有的 mutex：
+	 *   最终切入后 donor=A、curr=B，B 消耗 A 的调度资源以推进解锁。
+	 * 若 B 又等待 C，则继续沿链寻找可实际执行者。这与直接修改
+	 * B->prio 的优先级继承机制不同，不能用执行者的类代替 donor 的类
+	 * 做运行记账；也不能把当前实现理解为会自动把远端 owner 迁过来。
+	 */
 	/* Follow blocked_on chain. */
 	for (p = donor; task_is_blocked(p); p = owner) {
 		mutex = p->blocked_on;
@@ -7928,6 +8288,13 @@ static void __sched notrace __schedule(int sched_mode)
 	struct rq *rq;
 	int cpu;
 
+	/*
+	 * 按六步阅读下面的主体：
+	 *   固定本 CPU 并关闭中断 -> 锁住 rq、更新时钟 -> 处理 prev 的阻塞
+	 *   -> 调度类选 donor（按需找代理执行者）-> 发布 curr/统计
+	 *   -> 换栈并由切入者解锁，或原地解锁继续执行。
+	 * 只有最后选出的 next != prev 才发生真正上下文切换。
+	 */
 	/* Trace preemptions consistently with task switches */
 	trace_sched_entry_tp(sched_mode == SM_PREEMPT);
 
@@ -8146,6 +8513,10 @@ static inline void sched_submit_work(struct task_struct *tsk)
 	/*
 	 * If we are going to sleep and we have plugged IO queued,
 	 * make sure to submit it to avoid deadlocks.
+	 *
+	 * 典型依赖环是：当前任务等 I/O 完成，但请求还留在自己的 plug
+	 * 批次里尚未提交。睡眠前须先提交，让完成事件能产生。
+	 * 抢占仅暂停任务，不经过这套主动睡眠的准备流程。
 	 */
 	blk_flush_plug(tsk->plug, true);
 
@@ -8329,6 +8700,10 @@ asmlinkage __visible void __sched notrace preempt_schedule(void)
 	/*
 	 * If there is a non-zero preempt_count or interrupts are disabled,
 	 * we do not want to preempt the current task. Just return..
+	 *
+	 * need_resched 表示“应该换人”，preemptible 表示“此刻允许换人”。
+	 * 例如持有 raw 自旋锁时请求可以积累，必须等最外层临界区结束
+	 * 才能处理；本入口不会把调用者设置的睡眠状态提交成一次阻塞。
 	 */
 	if (likely(!preemptible()))
 		return;
@@ -8463,6 +8838,11 @@ asmlinkage __visible void __sched preempt_schedule_irq(void)
 
 	do {
 		preempt_disable();
+		/*
+		 * 禁止抢占以防递归，允许调度前的钩子处理中断；
+		 * __schedule 内部会重新关中断。返回后先关中断，再恢复计数，
+		 * 保持 IRQ 返回入口约定，最后检查期间新产生的重调度请求。
+		 */
 		local_irq_enable();
 		__schedule(SM_PREEMPT);
 		local_irq_disable();
@@ -8591,6 +8971,11 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	struct rq *rq;
 
 	/* XXX used to be waiter->prio, not waiter->task->prio */
+	/*
+	 * normal_prio 保留任务本来应有的优先级，prio 是当前有效值。
+	 * 提升可让普通任务临时进入 RT/DL 类；解除继承时再依据本来策略
+	 * 恢复，所以这里不能覆盖 policy 或 normal_prio。
+	 */
 	prio = __rt_effective_prio(pi_task, p->normal_prio);
 
 	/*
@@ -8649,6 +9034,10 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	if (prev_class != next_class && p->se.sched_delayed)
 		dequeue_task(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED | DEQUEUE_NOCLOCK);
 
+	/*
+	 * sched_change 的作用域入口保存并摘下任务，出口按新类/新优先级
+	 * 恢复队列与当前实体；类切换通知在队列已恢复后完成。
+	 */
 	scoped_guard (sched_change, p, queue_flag) {
 		/*
 		 * Boosting condition are:
@@ -8660,6 +9049,7 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 		 *          running task
 		 */
 		if (dl_prio(prio)) {
+			/* DL 还需关联提供者的截止时间实体。 */
 			if (!dl_prio(p->normal_prio) ||
 			    (pi_task && dl_prio(pi_task->prio) &&
 			     dl_entity_preempt(&pi_task->dl, &p->dl))) {
@@ -8791,6 +9181,10 @@ int __cond_resched_lock(spinlock_t *lock)
 	lockdep_assert_held(lock);
 
 	if (spin_needbreak(lock) || resched) {
+		/*
+		 * 返回时虽重新持锁，但临界区已被打断，共享状态可能变化；
+		 * 调用者不能保留仅由该锁保证有效的遍历位置或条件假设。
+		 */
 		spin_unlock(lock);
 		if (!_cond_resched())
 			cpu_relax();
@@ -8949,6 +9343,13 @@ static DEFINE_MUTEX(sched_dynamic_mutex);
  */
 static void __sched_dynamic_update(int mode)
 {
+	/*
+	 * 修改的是在哪些内核边界响应调度请求，不是任务的调度策略。
+	 * none 保留显式条件调度，voluntary 再启用 might_resched 点，
+	 * full 启用抢占/IRQ 返回入口，lazy 再允许部分请求延后响应。
+	 * 先全部启用安全入口，再按目标模式关闭多余入口，防止转换途中
+	 * 所有响应路径都关闭；静态调用/分支让常用路径少做动态判断。
+	 */
 	/*
 	 * Avoid {NONE,VOLUNTARY} -> FULL transitions from ever ending up in
 	 * the ZERO state, which is invalid.
@@ -9154,6 +9555,11 @@ int io_schedule_prepare(void)
 {
 	int old_iowait = current->in_iowait;
 
+	/*
+	 * in_iowait 是记账身份，不是 TASK_* 睡眠状态，调用者仍须按等待
+	 * 协议设置任务状态。保存旧值用于嵌套恢复，真正阻塞/唤醒时才
+	 * 由调度路径增减 rq->nr_iowait；先提交 plug 让待完成的 I/O 能推进。
+	 */
 	current->in_iowait = 1;
 	blk_flush_plug(current->plug, true);
 	return old_iowait;
@@ -9351,6 +9757,11 @@ void __init init_idle(struct task_struct *idle, int cpu)
 	rq->idle = idle;
 	rq_set_donor(rq, idle);
 	rcu_assign_pointer(rq->curr, idle);
+	/*
+	 * idle 是永远可选的特殊任务：标记 QUEUED/on_cpu，但不作为普通
+	 * 可运行任务增加 rq->nr_running。队列无工作时由 idle 类兜底，
+	 * 因而 nr_running==0 不表示 CPU 没有执行上下文。
+	 */
 	idle->on_rq = TASK_ON_RQ_QUEUED;
 	idle->on_cpu = 1;
 	raw_spin_rq_unlock(rq);
@@ -9526,6 +9937,11 @@ static void balance_push(struct rq *rq)
 {
 	struct task_struct *push_task = rq->curr;
 
+	/*
+	 * 下线不是一次性搬空：正在运行和禁止迁移的任务可能暂时留下。
+	 * 把回调持续挂在调度收尾处，每次切换再尝试推走当前普通任务；
+	 * 最终由 wait_empty 等待排空，再让 dying 回调核验并结算统计。
+	 */
 	lockdep_assert_rq_held(rq);
 
 	/*
@@ -9856,6 +10272,10 @@ int sched_cpu_deactivate(unsigned int cpu)
 	 */
 	nohz_balance_exit_idle(rq);
 
+	/*
+	 * 先阻止新的普通任务放置，再排出旧任务。清 active 不等于立即
+	 * 停止执行，CPU 仍在线，才能运行 stopper 和迁移禁用区的收尾。
+	 */
 	set_cpu_active(cpu, false);
 
 	/*
@@ -9878,6 +10298,7 @@ int sched_cpu_deactivate(unsigned int cpu)
 	 */
 	synchronize_rcu();
 
+	/* 旧选核读者退出后，再向各调度类宣告本 rq 不再承接工作。 */
 	sched_set_rq_offline(rq, cpu);
 
 	scx_rq_deactivate(rq);
@@ -10096,6 +10517,11 @@ void __init sched_init(void)
 	unsigned long ptr = 0;
 	int i;
 
+	/*
+	 * 类的先后由链接器布局确定，sched_class_above 比较该顺序；
+	 * 必须先确认 stop > DL > RT > fair > idle（有 ext 时插在 fair 后），
+	 * 后面的“找到首个可用任务即返回”才能成立。
+	 */
 	/* Make sure the linker didn't screw up */
 	BUG_ON(!sched_class_above(&stop_sched_class, &dl_sched_class));
 	BUG_ON(!sched_class_above(&dl_sched_class, &rt_sched_class));
@@ -10156,6 +10582,10 @@ void __init sched_init(void)
 	autogroup_init(&init_task);
 #endif /* CONFIG_CGROUP_SCHED */
 
+	/*
+	 * 为 possible CPU 初始化，即使它尚未 online；后续热插拔上线
+	 * 直接使用这些 rq、类子队列、定时器和统计，无需在切换时分配。
+	 */
 	for_each_possible_cpu(i) {
 		struct rq *rq;
 
@@ -10286,6 +10716,10 @@ void __init sched_init(void)
 
 	preempt_dynamic_init();
 
+	/*
+	 * 基础 rq/idle/类设施就绪后才发布运行标记。SMP 拓扑和调度域
+	 * 在稍后的 sched_init_smp 建立，不能把该标记当 SMP 初始化完成。
+	 */
 	scheduler_running = 1;
 }
 
@@ -10347,6 +10781,11 @@ static inline bool resched_offsets_ok(unsigned int offsets)
  */
 void __might_resched(const char *file, int line, unsigned int offsets)
 {
+	/*
+	 * 这是调用上下文诊断，不负责发起调度。offsets 描述调用点允许
+	 * 存在的抢占/RCU 嵌套量；比较实际计数而非只判断是否为零，
+	 * 才能处理某些封装内部自带计数偏移的合法调用点。
+	 */
 	/* Ratelimiting timestamp: */
 	static unsigned long prev_jiffy;
 
@@ -10540,6 +10979,22 @@ struct task_struct *curr_task(int cpu)
 static DEFINE_SPINLOCK(task_group_lock);
 
 /*
+ * task_group 是 CPU cgroup 的调度表示，不是一条全局任务队列。
+ * 每组可在每个 CPU 上拥有 cfs_rq/rt_rq 及代表该组的调度实体；
+ * 任务竞争组内资源，组实体再在父组中竞争，形成层级调度。
+ * task_group_lock 保护层级发布/摘除，RCU 保护遍历期间的对象存活，
+ * 各 rq 锁保护相应 CPU 的实体和队列；组锁不能代替 rq 锁。
+ *
+ * CPU cgroup 的正常生命周期可沿回调分成两条线阅读：
+ *   创建：css_alloc -> sched_create_group -> css_online -> sched_online_group。
+ *   回收：css_released 摘除层级 -> cgroup 提供 RCU 宽限期
+ *         -> css_free 直接注销类资源 -> RCU 回调释放内存。
+ * 其他使用 sched_destroy_group() 的路径由它安排第一次 RCU 回调，
+ * 再进入共同的注销/延迟释放流程，不能给 css_free 重复套这一步。
+ * 分配成功并不等于已向遍历者发布；从层级摘除也不等于旧读者已退出。
+ */
+
+/*
  * alloc_uclamp_sched_group - 初始化新任务组的钳制请求，
  * 并继承父组的有效钳制值。
  */
@@ -10582,6 +11037,11 @@ static void sched_free_group_rcu(struct rcu_head *rcu)
  */
 static void sched_unregister_group(struct task_group *tg)
 {
+	/*
+	 * 摘掉组层级后先等待旧层级读者，再注销类队列；注销后还要等
+	 * 可能通过调试/统计接口访问旧 cfs_rq 的读者，才可真正释放。
+	 * 因而“从树中消失”和“内存可回收”是不同阶段。
+	 */
 	unregister_fair_sched_group(tg);
 	unregister_rt_sched_group(tg);
 	/*
@@ -10709,6 +11169,11 @@ static void sched_change_group(struct task_struct *tsk)
 	tg = autogroup_task_group(tsk, tg);
 	tsk->sched_task_group = tg;
 
+	/*
+	 * cgroup 决定资源归属，autogroup 可能再映射到自动调度组；
+	 * task_change_group/set_task_rq 则把这个归属落实到当前 CPU 的
+	 * 类内队列及父实体。只改 sched_task_group 指针会留下旧队列关联。
+	 */
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	if (tsk->sched_class->task_change_group)
 		tsk->sched_class->task_change_group(tsk);
@@ -10740,6 +11205,11 @@ void sched_move_task(struct task_struct *tsk, bool for_autogroup)
 
 	update_rq_clock(rq);
 
+	/*
+	 * 同一个 CPU 上换组也要出旧队列、改 se.parent/cfs_rq、入新队列；
+	 * 不必改变 task_cpu。若是当前 donor，更新后请求重新选择，
+	 * 让新组的权重/带宽立即参与调度决策。
+	 */
 	scoped_guard (sched_change, tsk, queue_flags) {
 		sched_change_group(tsk);
 		if (!for_autogroup)
@@ -10897,6 +11367,11 @@ static void cpu_util_update_eff(struct cgroup_subsys_state *css)
 	WARN_ON_ONCE(!rcu_read_lock_held());
 
 	css_for_each_descendant_pre(css, top_css) {
+		/*
+		 * 前序遍历先更新父再更新子。这里两个维度均由父的有效值
+		 * 作为上界：子组不能请求比父组允许的更高保护或更高上限，
+		 * 最后再把 min 截到 max，保持有效区间不颠倒。
+		 */
 		uc_parent = css_tg(css)->parent
 			? css_tg(css)->parent->uclamp : NULL;
 
@@ -10923,6 +11398,7 @@ static void cpu_util_update_eff(struct cgroup_subsys_state *css)
 			clamps |= (0x1 << clamp_id);
 		}
 		if (!clamps) {
+			/* 有效约束未变，后代输入也未变，可跳过子树。 */
 			css = css_rightmost_descendant(css);
 			continue;
 		}
@@ -11140,6 +11616,11 @@ static int tg_set_cfs_bandwidth(struct task_group *tg,
 	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
 	u64 period, quota, burst;
 
+	/*
+	 * 用户接口使用微秒，内部预算使用纳秒；RUNTIME_INF 必须原样
+	 * 保留，不能参与乘法。quota 是一个组跨 CPU 共享的周期预算，
+	 * 各 CPU 的 cfs_rq 再从组预算取得本地运行额度。
+	 */
 	period = (u64)period_us * NSEC_PER_USEC;
 
 	if (quota_us == RUNTIME_INF)
@@ -11156,6 +11637,13 @@ static int tg_set_cfs_bandwidth(struct task_group *tg,
 	guard(cpus_read_lock)();
 	guard(mutex)(&cfs_constraints_mutex);
 
+	/*
+	 * 锁分工：cpus_read_lock 稳住 CPU 热插拔，约束互斥锁串行化
+	 * 组树带宽修改，cfs_b->lock 保护共享预算，rq 锁保护本地额度。
+	 * 下方先释放 cfs_b->lock 再逐个获取 rq 锁，不能把两者倒序嵌套；
+	 * 运行时分配额度的路径会在 rq 锁内获取带宽锁。
+	 */
+	/* 先用候选值验证整棵组树，失败时不发布新的带宽配置。 */
 	ret = __cfs_schedulable(tg, period, quota);
 	if (ret)
 		return ret;
@@ -11188,6 +11676,10 @@ static int tg_set_cfs_bandwidth(struct task_group *tg,
 		struct cfs_rq *cfs_rq = tg->cfs_rq[i];
 		struct rq *rq = cfs_rq->rq;
 
+		/*
+		 * 组级预算已更新，再逐 CPU 刷新本地执行许可。不能保留旧的
+		 * 负债和限流状态，否则放宽配额后可能无谓地等待旧周期。
+		 */
 		guard(rq_lock_irq)(rq);
 		cfs_rq->runtime_enabled = runtime_enabled;
 		cfs_rq->runtime_remaining = 1;
@@ -11288,6 +11780,12 @@ static int tg_cfs_schedulable_down(struct task_group *tg, void *data)
 	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
 	s64 quota = 0, parent_quota = -1;
 
+	/*
+	 * 比较的是 quota/period 的归一化比例，不是配额的绝对微秒数。
+	 * 此检查没有要求所有子组配额之和小于父组：子组可以超额配置，
+	 * 同时繁忙时仍共同受父组预算限制。v1 对单个子组的显式上限
+	 * 超过父组时报错，v2 则取父子有效上限的较小者。
+	 */
 	if (!tg->parent) {
 		quota = RUNTIME_INF;
 	} else {
@@ -11456,6 +11954,12 @@ static int tg_set_bandwidth(struct task_group *tg,
 	const u64 max_usec = U64_MAX / NSEC_PER_USEC;
 	int ret = 0;
 
+	/*
+	 * 带宽、权重和 uclamp 是三种不同控制：quota/period 限累计时间，
+	 * weight 决定有竞争时的相对份额，uclamp 影响性能需求信号。
+	 * 例如 quota=200000us、period=100000us 是组总计两个 CPU 的
+	 * 平均预算，允许任务在多个 CPU 并行，并非固定单 CPU 的时间片。
+	 */
 	if (tg == &root_task_group)
 		return -EINVAL;
 
@@ -11945,6 +12449,11 @@ static ssize_t cpu_max_write(struct kernfs_open_file *of,
 }
 #endif /* CONFIG_CFS_BANDWIDTH */
 
+/*
+ * cgroup v2 文件到上面控制逻辑的映射：weight/weight.nice 调相对权重，
+ * max/max.burst 调时间预算，uclamp.* 调容量信号。cftype 只注册接口，
+ * 实际参数校验、层级传播和各 CPU 队列更新由相应回调完成。
+ */
 static struct cftype cpu_files[] = {
 #ifdef CONFIG_GROUP_SCHED_WEIGHT
 	{
@@ -12089,6 +12598,18 @@ void call_trace_sched_update_nr_running(struct rq *rq, int count)
 }
 
 #ifdef CONFIG_SCHED_MM_CID
+
+/*
+ * MM CID（地址空间并发 ID）按 mm 分配紧凑编号，供用户态使用
+ * 同一地址空间内的并发执行槽位；它不是 PID、物理 CPU 编号或 ASID。
+ * mm->pcpu_cid 保存各 CPU 对该 mm 的编号缓存，任务的 mm_cid
+ * 记录当前编号，last_mm_cid 为迁移优化保存线索。
+ * 编号可缓存、转移、回收，因此用户态不能把它当任务的永久身份。
+ *
+ * 本节两项工作：迁移时尽量复用旧编号，使编号集合靠近 0；
+ * 定期回收不再活跃的缓存，避免少量线程遍历许多 CPU 后占满编号。
+ * 分配/本地切换细节见 sched.h 的 mm_cid_get()/switch_mm_cid()。
+ */
 
 /*
  * @cid_lock: Guarantee forward-progress of cid allocation.
@@ -12312,6 +12833,10 @@ int __sched_mm_cid_migrate_from_try_steal_cid(struct rq *src_rq,
 	 */
 	if (!try_cmpxchg(&src_pcpu_cid->cid, &lazy_cid, MM_CID_UNSET))
 		return -1;
+	/*
+	 * 此处只解除源 CPU 绑定，不归还分配位图：成功返回后由调用者
+	 * 决定转给目标 CPU 还是释放；失败则不取得编号所有权。
+	 */
 	WRITE_ONCE(src_pcpu_cid->recent_cid, MM_CID_UNSET);
 	return src_cid;
 }
@@ -12338,6 +12863,12 @@ void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t)
 
 	if (!mm)
 		return;
+	/*
+	 * 编号缓存属于 (mm, CPU)，而非任务私有。例如同 mm 的另一线程
+	 * 还在源 CPU 执行时，即使 t 已迁走，也不能把源编号拿给目标。
+	 * fetch 只找候选，try_steal 才通过原子协议取得所有权；中间的
+	 * 检查失败是允许的，后续上下文切换仍可走常规编号分配。
+	 */
 	src_cpu = t->migrate_from_cpu;
 	if (src_cpu == -1) {
 		t->last_mm_cid = -1;
@@ -12372,6 +12903,7 @@ void sched_mm_cid_migrate_to(struct rq *dst_rq, struct task_struct *t)
 	if (src_cid == -1)
 		return;
 	if (dst_cid_is_set) {
+		/* 目标已有编号，只回收源编号，不覆盖目标缓存。 */
 		__mm_cid_put(mm, src_cid);
 		return;
 	}
@@ -12549,6 +13081,11 @@ static void task_mm_cid_work(struct callback_head *work)
 		sched_mm_cid_remote_clear_old(mm, cpu);
 	weight = cpumask_weight(cidmask);
 	/*
+	 * 若已分配 N 个编号却存在编号 >= N，说明集合有空洞。
+	 * 尝试撤掉高位缓存，让后续分配优先填低位；仍活跃的编号不会
+	 * 被强行释放，所以紧凑化是逐步完成，不要求每轮扫描后连续。
+	 */
+	/*
 	 * Clear cids that are greater or equal to the cidmask weight to
 	 * recompact it.
 	 */
@@ -12589,6 +13126,10 @@ void task_tick_mm_cid(struct rq *rq, struct task_struct *curr)
 	if (time_before(now, READ_ONCE(curr->mm->mm_cid_next_scan)))
 		return;
 
+	/*
+	 * tick 只提交工作，扫描所有 CPU 的操作放到该任务返回用户态前
+	 * 执行。work->next 自指表示尚未排队，防止每个 tick 重复添加。
+	 */
 	/* No page allocation under rq lock */
 	task_work_add(curr, work, TWA_RESUME);
 }
@@ -12696,6 +13237,14 @@ struct sched_change_ctx *sched_change_begin(struct task_struct *p, unsigned int 
 
 	lockdep_assert_rq_held(rq);
 
+	/*
+	 * 每 CPU 仅一份 ctx，调用者必须在同一非迁移持锁区间成对使用。
+	 * queued 与 running 分开保存：当前 donor 与“在队列上”不是
+	 * 同一问题，修改属性后分别恢复队列位置和类的当前实体状态。
+	 * scoped_guard(sched_change, ...) 利用 sched.h 中的 DEFINE_CLASS
+	 * 在离开作用域时自动调用 end；阅读这类调用时，闭合花括号也就
+	 * 是重新入队/恢复当前实体的时刻，不能只找显式的 end 调用。
+	 */
 	*ctx = (struct sched_change_ctx){
 		.p = p,
 		.flags = flags,
@@ -12723,6 +13272,11 @@ void sched_change_end(struct sched_change_ctx *ctx)
 
 	lockdep_assert_rq_held(rq);
 
+	/*
+	 * begin 传入的 SAVE/MOVE 等位与 ENQUEUE 对应位配合使用；
+	 * 调用者可在作用域内追加 HEAD/REPLENISH 等入队要求。按新的
+	 * sched_class 恢复，故属性/类修改必须发生在 begin 和 end 之间。
+	 */
 	if (ctx->queued)
 		enqueue_task(rq, p, ctx->flags | ENQUEUE_NOCLOCK);
 	if (ctx->running)
