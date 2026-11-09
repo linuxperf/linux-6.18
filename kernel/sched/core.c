@@ -1359,17 +1359,18 @@ static bool __wake_q_add(struct wake_q_head *head, struct task_struct *task)
 }
 
 /**
- * wake_q_add() - queue a wakeup for 'later' waking.
- * 将任务加入批量唤醒队列，并在首次入队时获取任务引用。
- * @head: the wake_q_head to add @task to
- * @task: the task to queue for 'later' wakeup
+ * wake_q_add - 将任务加入唤醒队列，供后续批量唤醒
+ * @head: 当前上下文独占使用的唤醒队列
+ * @task: 待加入唤醒队列的任务
  *
- * Queue a task for later wakeup, most likely by the wake_up_q() call in the
- * same context, _HOWEVER_ this is not guaranteed, the wakeup can come
- * instantly.
+ * 仅在本次成功入队时获取一份任务引用，由 wake_up_q() 在处理该节点、
+ * 执行唤醒后释放。若任务已在本队列或其他 wake_q 中，则不重复入队或
+ * 增加引用，由已有队列负责唤醒。
  *
- * This function must be used as-if it were wake_up_process(); IOW the task
- * must be ready to be woken at this location.
+ * 通常由当前上下文随后调用 wake_up_q() 执行唤醒，但任务可能已在
+ * 其他上下文的队列中，并被其立即唤醒，不能依赖上述延迟。
+ * 因此，调用者必须像调用 wake_up_process() 一样，在调用前完成
+ * 唤醒所需的状态更新，并保证成功入队的任务最终由 wake_up_q() 处理。
  */
 void wake_q_add(struct wake_q_head *head, struct task_struct *task)
 {
